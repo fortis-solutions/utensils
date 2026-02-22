@@ -1,0 +1,107 @@
+Make sure when you run this file that you run it like this as it needs elevated permissions.
+
+  ' C:\Windows\system32> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+Unblock-File "C:\Users\labuser\Documents\SK-UNSECURE SCRIPT.ps1" 
+& "C:\Users\labuser\Documents\SK-UNSECURE SCRIPT.ps1" 
+
+- Wherever you saved the file just input the location. This example is just mine.
+
+
+<#
+SK-ScannerAccess-LAB.ps1
+PowerShell 5.1 / ISE safe.
+
+LAB USE ONLY.
+Does:
+- Ensures SMB-related services are running
+- Enables File & Printer Sharing firewall rules (even though firewall will be turned off)
+- Turns Windows Firewall OFF (Domain/Private/Public)
+- Prints quick “reachability” indicators (listening ports + local IP)
+
+IMPORTANT:
+- Do NOT leave firewall off on internet-exposed machines.
+- In Azure, NSG rules can still block scanner->VM even if Windows firewall is off.
+#>
+
+[CmdletBinding()]
+param(
+  [ValidateSet("Enable","Disable")]
+  [string]$Mode = "Enable"
+)
+
+function Assert-Admin {
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $p  = New-Object Security.Principal.WindowsPrincipal($id)
+  if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run PowerShell as Administrator."
+  }
+}
+
+function Set-ServiceState {
+  param(
+    [Parameter(Mandatory=$true)][string]$Name,
+    [string]$StartupType = "Automatic"
+  )
+
+  $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+  if ($null -eq $svc) { return }
+
+  try { Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop } catch {}
+  if ($svc.Status -ne "Running") { try { Start-Service -Name $Name -ErrorAction Stop } catch {} }
+}
+
+Assert-Admin
+
+if ($Mode -eq "Enable") {
+
+  # Core services for SMB / remote checks
+  Set-ServiceState -Name "LanmanServer" -StartupType "Automatic"
+  Set-ServiceState -Name "LanmanWorkstation" -StartupType "Automatic"
+  Set-ServiceState -Name "Winmgmt" -StartupType "Automatic"
+  Set-ServiceState -Name "RemoteRegistry" -StartupType "Manual"
+
+  # Ensure SMB2 is on (safe default). SMB1 stays off.
+  try { Set-SmbServerConfiguration -EnableSMB2Protocol $true -EnableSMB1Protocol $false -Force | Out-Null } catch {}
+
+  # Enable File & Printer Sharing rules (not required if firewall is off, but fine)
+  try { Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing" -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+  # FIREWALL OFF (all profiles)
+  Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled False
+
+} else {
+
+  # FIREWALL ON
+  Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+
+  # Optional rollback: stop RemoteRegistry again
+  try { Stop-Service -Name "RemoteRegistry" -ErrorAction SilentlyContinue } catch {}
+}
+
+# ---- Status / Reachability indicators ----
+Write-Host ("Mode: {0}" -f $Mode)
+Write-Host "Firewall profiles:"
+Get-NetFirewallProfile | Select Name, Enabled | Format-Table -AutoSize
+
+Write-Host "`nService status:"
+Get-Service LanmanServer,LanmanWorkstation,Winmgmt,RemoteRegistry | Select Name, Status, StartType | Format-Table -AutoSize
+
+Write-Host "`nListening ports (if present):"
+$ports = 445,139,135,5985,3389
+foreach ($p in $ports) {
+  $listening = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
+  if ($listening) {
+    Write-Host ("Port {0}: LISTENING" -f $p)
+  } else {
+    Write-Host ("Port {0}: not listening (or blocked by service/OS)" -f $p)
+  }
+}
+
+Write-Host "`nLocal IPs:"
+Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } |
+  Select InterfaceAlias, IPAddress |
+  Format-Table -AutoSize
+
+Write-Host "`nNOTE: In Azure, NSG rules can still block scanner->VM even with Windows firewall off."
+Write-Host "TIP: For Tenable credentialed scanning, scan the VM PRIVATE IP from a scanner in the same VNet." 
