@@ -1,26 +1,51 @@
-Make sure when you run this file that you run it like this as it needs elevated permissions.
-
-  ' C:\Windows\system32> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-Unblock-File "C:\Users\labuser\Documents\SK-UNSECURE SCRIPT.ps1" 
-& "C:\Users\labuser\Documents\SK-UNSECURE SCRIPT.ps1" 
-
-- Wherever you saved the file just input the location. This example is just mine.
-
-
 <#
 SK-ScannerAccess-LAB.ps1
 PowerShell 5.1 / ISE safe.
 
 LAB USE ONLY.
-Does:
-- Ensures SMB-related services are running
-- Enables File & Printer Sharing firewall rules (even though firewall will be turned off)
-- Turns Windows Firewall OFF (Domain/Private/Public)
-- Prints quick “reachability” indicators (listening ports + local IP)
 
-IMPORTANT:
-- Do NOT leave firewall off on internet-exposed machines.
-- In Azure, NSG rules can still block scanner->VM even if Windows firewall is off.
+WHAT THIS SCRIPT DOES (Enable mode)
+- Ensures SMB-related services are running
+- Enables File & Printer Sharing firewall rules (even though firewall is turned off)
+- Turns Windows Firewall OFF (Domain/Private/Public)
+- Prints quick “reachability” indicators (listening ports + local IPs)
+
+WHAT THIS SCRIPT DOES (Disable mode)
+- Turns Windows Firewall back ON (Domain/Private/Public)
+- Stops RemoteRegistry (basic rollback)
+
+IMPORTANT
+- Run this script in an elevated PowerShell window (Run as Administrator)
+- Do NOT leave Windows Firewall off on internet-exposed machines
+- In Azure, NSG rules can still block scanner -> VM even if Windows Firewall is off
+
+HOW TO RUN (ADMIN REQUIRED)
+1) Open PowerShell as Administrator
+2) Replace the path below with wherever you saved this file
+3) Run:
+
+   Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+   Unblock-File "C:\Path\To\SK-ScannerAccess-LAB.ps1"
+   & "C:\Path\To\SK-ScannerAccess-LAB.ps1"
+
+EXAMPLES
+- Enable mode (default):
+   & "C:\Path\To\SK-ScannerAccess-LAB.ps1"
+
+- Disable mode (rollback):
+   & "C:\Path\To\SK-ScannerAccess-LAB.ps1" -Mode Disable
+
+COMMON MISTAKE (IMPORTANT)
+- Do NOT paste PowerShell prompt text into commands or into this .ps1 file
+  e.g. DO NOT include:
+    PS C:\Windows\system32>
+    C:\Windows\system32>
+- Those are just prompt indicators, not part of the command
+
+TROUBLESHOOTING
+- If you see:
+    The string is missing the terminator: '
+  it usually means a stray single quote (') or copied prompt text was pasted into the script file.
 #>
 
 [CmdletBinding()]
@@ -104,4 +129,4 @@ Get-NetIPAddress -AddressFamily IPv4 |
   Format-Table -AutoSize
 
 Write-Host "`nNOTE: In Azure, NSG rules can still block scanner->VM even with Windows firewall off."
-Write-Host "TIP: For Tenable credentialed scanning, scan the VM PRIVATE IP from a scanner in the same VNet." 
+Write-Host "TIP: For Tenable credentialed scanning, scan the VM PRIVATE IP from a scanner in the same VNet."
