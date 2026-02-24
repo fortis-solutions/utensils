@@ -1,0 +1,111 @@
+# ============================
+# Uninstall Wireshark (silent)
+# PowerShell 5.1 / ISE safe
+# ============================
+
+$ErrorActionPreference = 'Stop'
+
+function Assert-Admin {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if (-not $isAdmin) { throw "Run PowerShell as Administrator." }
+}
+
+function Stop-WiresharkProcesses {
+    $names = @('Wireshark','dumpcap','tshark')
+    foreach ($n in $names) {
+        Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
+        }
+    }
+}
+
+function Get-WiresharkInstalls {
+    $paths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    $apps = foreach ($p in $paths) {
+        Get-ItemProperty $p -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like "Wireshark*" }
+    }
+
+    # Return all matches (sometimes multiple entries exist)
+    $apps | Sort-Object DisplayVersion -Descending
+}
+
+function Invoke-WiresharkUninstall {
+    param([Parameter(Mandatory)]$App)
+
+    $display = "$($App.DisplayName) $($App.DisplayVersion)"
+    Write-Host "Found: $display"
+
+    $quiet = $App.QuietUninstallString
+    $uninst = $App.UninstallString
+
+    if ($quiet) {
+        Write-Host "Using QuietUninstallString (silent)."
+        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $quiet" -Wait -PassThru
+        return $p.ExitCode
+    }
+
+    if (-not $uninst) {
+        throw "No uninstall command found for: $display"
+    }
+
+    # If it's MSI, try to extract the product code and uninstall silently
+    if ($uninst -match "msiexec\.exe" -or $uninst -match "MsiExec\.exe") {
+        $match = (Select-String -InputObject $uninst -Pattern '\{[0-9A-Fa-f\-]{36}\}' -AllMatches)
+        $guid = $null
+        if ($match.Matches.Count -gt 0) { $guid = $match.Matches[0].Value }
+
+        if ($guid) {
+            $args = "/x $guid /qn /norestart"
+            Write-Host "Running: msiexec.exe $args"
+            $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
+            return $p.ExitCode
+        }
+
+        # Fallback: run the uninstall string with /qn
+        Write-Host "MSI detected but GUID not found; running uninstall string with /qn fallback."
+        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $uninst /qn /norestart" -Wait -PassThru
+        return $p.ExitCode
+    }
+
+    # EXE uninstaller: add /S if missing (common silent switch)
+    $cmd = $uninst
+    if ($cmd -notmatch "(\s|^)/S(\s|$)") {
+        $cmd = "$cmd /S"
+    }
+
+    Write-Host "Running EXE uninstall (silent): $cmd"
+    $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $cmd" -Wait -PassThru
+    return $p.ExitCode
+}
+
+# ---- MAIN ----
+Assert-Admin
+Stop-WiresharkProcesses
+
+$installs = Get-WiresharkInstalls
+if (-not $installs) {
+    Write-Host "Wireshark not found. Nothing to uninstall."
+    return
+}
+
+foreach ($app in $installs) {
+    $code = Invoke-WiresharkUninstall -App $app
+    Write-Host "Uninstall exit code: $code"
+}
+
+# Verify removal
+Start-Sleep -Seconds 2
+$check = Get-WiresharkInstalls
+if (-not $check) {
+    Write-Host "Done ✅ Wireshark appears uninstalled."
+} else {
+    Write-Host "Wireshark entries still detected. A reboot may be required, or a second uninstall pass."
+    $check | Select-Object DisplayName, DisplayVersion, Publisher
+}
