@@ -1,41 +1,192 @@
-# ============================
-# Fix: Require SMB Signing
-# Remediates: "SMB Signing not required"
-# PowerShell 5.1 / ISE safe
-# ============================
+<#
+Harden-GuestAccount.ps1  (PowerShell 5.1 / ISE safe)
 
-$ErrorActionPreference = 'Stop'
+Goal:
+- Guest account should NOT be in Administrators (or other privileged groups)
+- Move to minimal privilege (Guests group) and optionally disable the account
+
+What it does (Local machine):
+- Locates built-in Guest by SID ending in -501 (works even if renamed)
+- Removes Guest from: Administrators, Remote Desktop Users, Backup Operators, Power Users
+- Adds Guest to: Guests (optional)
+- Disables Guest (optional, recommended)
+
+Domain Controllers:
+- LocalAccounts cmdlets don’t apply on DCs the same way.
+- Script detects DC and prints guidance (or uses AD module if you extend it).
+
+LAB SAFE, but still: run with care on production.
+#>
+
+[CmdletBinding()]
+param()
+
+# =========================
+# CONFIG (EDIT THIS)
+# =========================
+$AddToGuestsGroup = $true     # minimal local rights group
+$DisableGuest     = $true     # recommended hardening
+
+# Which groups to remove Guest from (local)
+$PrivilegedGroupsToRemove = @(
+    'Administrators',
+    'Remote Desktop Users',
+    'Backup Operators',
+    'Power Users'
+)
+
+$LogPath = "$env:TEMP\Harden-GuestAccount.log"
+# =========================
+
+function Write-Log {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] $Message"
+    $line | Tee-Object -FilePath $LogPath -Append
+}
 
 function Assert-Admin {
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) { throw "Run PowerShell as Administrator." }
+
+    if (-not $isAdmin) { throw "Run this script as Administrator." }
 }
 
-Assert-Admin
+function Test-IsDomainController {
+    # 4 = Backup DC, 5 = Primary DC
+    $role = (Get-CimInstance Win32_ComputerSystem).DomainRole
+    return ($role -ge 4)
+}
 
-Write-Host "Requiring SMB signing (server + client)..." -ForegroundColor Cyan
+function Get-LocalGuestByRid501 {
+    # Finds the built-in Guest even if it was renamed (SID ends with -501)
+    try {
+        $guest = Get-LocalUser -ErrorAction Stop | Where-Object { $_.SID.Value -match '-501$' } | Select-Object -First 1
+        return $guest
+    } catch {
+        return $null
+    }
+}
 
-# --- Server: require signing ---
-# Policy: Microsoft network server: Digitally sign communications (always) = Enabled
-$serverKey = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
-New-Item -Path $serverKey -Force | Out-Null
-Set-ItemProperty -Path $serverKey -Name "RequireSecuritySignature" -Type DWord -Value 1
-Set-ItemProperty -Path $serverKey -Name "EnableSecuritySignature"  -Type DWord -Value 1
+function Is-MemberOfLocalGroup {
+    param(
+        [Parameter(Mandatory)][string]$GroupName,
+        [Parameter(Mandatory)][string]$MemberName
+    )
+    try {
+        $members = Get-LocalGroupMember -Group $GroupName -ErrorAction Stop
+        return ($members.Name -contains $MemberName)
+    } catch {
+        return $false
+    }
+}
 
-# --- Client: require signing ---
-# Policy: Microsoft network client: Digitally sign communications (always) = Enabled
-$clientKey = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
-New-Item -Path $clientKey -Force | Out-Null
-Set-ItemProperty -Path $clientKey -Name "RequireSecuritySignature" -Type DWord -Value 1
-Set-ItemProperty -Path $clientKey -Name "EnableSecuritySignature"  -Type DWord -Value 1
+function Remove-FromLocalGroupIfPresent {
+    param(
+        [Parameter(Mandatory)][string]$GroupName,
+        [Parameter(Mandatory)][string]$MemberName
+    )
 
-# Restart SMB server service so change is picked up
-Write-Host "Restarting Server service (LanmanServer)..." -ForegroundColor Cyan
-Restart-Service -Name "LanmanServer" -Force
+    if (Is-MemberOfLocalGroup -GroupName $GroupName -MemberName $MemberName) {
+        Write-Log "Removing [$MemberName] from local group [$GroupName]..."
+        try {
+            Remove-LocalGroupMember -Group $GroupName -Member $MemberName -ErrorAction Stop
+            Write-Log "Removed."
+        } catch {
+            Write-Log "FAILED to remove from [$GroupName]: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log "[$MemberName] is not a member of [$GroupName] (ok)."
+    }
+}
 
-# Optional: restart workstation service too (can disrupt some sessions)
-# Restart-Service -Name "LanmanWorkstation" -Force
+function Add-ToLocalGroupIfMissing {
+    param(
+        [Parameter(Mandatory)][string]$GroupName,
+        [Parameter(Mandatory)][string]$MemberName
+    )
 
-Write-Host "`nDone ✅ SMB signing is now REQUIRED." -ForegroundColor Green
-Write-Host "Re-run the Tenable scan to confirm the finding clears."
+    if (-not (Is-MemberOfLocalGroup -GroupName $GroupName -MemberName $MemberName)) {
+        Write-Log "Adding [$MemberName] to local group [$GroupName]..."
+        try {
+            Add-LocalGroupMember -Group $GroupName -Member $MemberName -ErrorAction Stop
+            Write-Log "Added."
+        } catch {
+            Write-Log "FAILED to add to [$GroupName]: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log "[$MemberName] already in [$GroupName] (ok)."
+    }
+}
+
+# -------------------------
+# Main
+# -------------------------
+try {
+    New-Item -ItemType File -Path $LogPath -Force | Out-Null
+    Assert-Admin
+
+    Write-Log "=== Harden-GuestAccount starting ==="
+
+    if (Test-IsDomainController) {
+        Write-Log "This machine appears to be a Domain Controller (DomainRole >= 4)."
+        Write-Log "Local guest/group hardening should be done in Active Directory instead."
+        Write-Log "If your issue is a DOMAIN Guest in Domain Admins, remove it from domain groups like:"
+        Write-Log " - Domain Admins, Enterprise Admins, Administrators, Account Operators, Backup Operators"
+        Write-Log "Then disable the domain Guest account."
+        throw "Domain Controller detected. Exiting to avoid doing the wrong thing with local groups."
+    }
+
+    # Ensure LocalAccounts module cmdlets exist
+    if (-not (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
+        throw "Get-LocalUser not found. This script requires Windows PowerShell 5.1 LocalAccounts cmdlets (Server 2016+/Win10+)."
+    }
+
+    $guest = Get-LocalGuestByRid501
+    if (-not $guest) {
+        throw "Built-in Guest account (RID 501) not found on this machine."
+    }
+
+    # MemberName format returned by Get-LocalGroupMember is usually like COMPUTERNAME\Guest
+    $computer = $env:COMPUTERNAME
+    $guestMemberName = "$computer\$($guest.Name)"
+
+    Write-Log "Found Guest account: Name=$($guest.Name) SID=$($guest.SID.Value) Enabled=$($guest.Enabled)"
+    Write-Log "Target identity for group operations: $guestMemberName"
+
+    # Remove from privileged groups
+    foreach ($g in $PrivilegedGroupsToRemove) {
+        Remove-FromLocalGroupIfPresent -GroupName $g -MemberName $guestMemberName
+    }
+
+    # Add to Guests group (minimal)
+    if ($AddToGuestsGroup) {
+        Add-ToLocalGroupIfMissing -GroupName 'Guests' -MemberName $guestMemberName
+    }
+
+    # Disable Guest (recommended)
+    if ($DisableGuest) {
+        if ($guest.Enabled -eq $true) {
+            Write-Log "Disabling Guest account..."
+            try {
+                Disable-LocalUser -Name $guest.Name -ErrorAction Stop
+                Write-Log "Guest account disabled."
+            } catch {
+                Write-Log "FAILED to disable Guest: $($_.Exception.Message)"
+            }
+        } else {
+            Write-Log "Guest account already disabled (ok)."
+        }
+    }
+
+    # Final state summary
+    $guestAfter = Get-LocalUser | Where-Object { $_.SID.Value -match '-501$' } | Select-Object -First 1
+    Write-Log "Final state: Name=$($guestAfter.Name) Enabled=$($guestAfter.Enabled)"
+
+    Write-Log "=== Harden-GuestAccount finished ==="
+    "Done. Log saved to: $LogPath"
+}
+catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+    throw
+}
