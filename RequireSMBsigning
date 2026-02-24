@@ -1,0 +1,41 @@
+# ============================
+# Fix: Require SMB Signing
+# Remediates: "SMB Signing not required"
+# PowerShell 5.1 / ISE safe
+# ============================
+
+$ErrorActionPreference = 'Stop'
+
+function Assert-Admin {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) { throw "Run PowerShell as Administrator." }
+}
+
+Assert-Admin
+
+Write-Host "Requiring SMB signing (server + client)..." -ForegroundColor Cyan
+
+# --- Server: require signing ---
+# Policy: Microsoft network server: Digitally sign communications (always) = Enabled
+$serverKey = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+New-Item -Path $serverKey -Force | Out-Null
+Set-ItemProperty -Path $serverKey -Name "RequireSecuritySignature" -Type DWord -Value 1
+Set-ItemProperty -Path $serverKey -Name "EnableSecuritySignature"  -Type DWord -Value 1
+
+# --- Client: require signing ---
+# Policy: Microsoft network client: Digitally sign communications (always) = Enabled
+$clientKey = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
+New-Item -Path $clientKey -Force | Out-Null
+Set-ItemProperty -Path $clientKey -Name "RequireSecuritySignature" -Type DWord -Value 1
+Set-ItemProperty -Path $clientKey -Name "EnableSecuritySignature"  -Type DWord -Value 1
+
+# Restart SMB server service so change is picked up
+Write-Host "Restarting Server service (LanmanServer)..." -ForegroundColor Cyan
+Restart-Service -Name "LanmanServer" -Force
+
+# Optional: restart workstation service too (can disrupt some sessions)
+# Restart-Service -Name "LanmanWorkstation" -Force
+
+Write-Host "`nDone ✅ SMB signing is now REQUIRED." -ForegroundColor Green
+Write-Host "Re-run the Tenable scan to confirm the finding clears."
